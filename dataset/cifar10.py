@@ -47,8 +47,11 @@ def train_val_split(labels, n_labeled_per_class):
 
     return train_labeled_idxs, train_unlabeled_idxs, val_idxs
 
-cifar10_mean = (0.4914, 0.4822, 0.4465) # equals np.mean(train_set.train_data, axis=(0,1,2))/255
-cifar10_std = (0.2471, 0.2435, 0.2616) # equals np.std(train_set.train_data, axis=(0,1,2))/255
+# cifar10_mean = (0.4914, 0.4822, 0.4465) # equals np.mean(train_set.train_data, axis=(0,1,2))/255
+# cifar10_std = (0.2471, 0.2435, 0.2616) # equals np.std(train_set.train_data, axis=(0,1,2))/255
+
+cifar10_mean = (0.4914, 0.4822, 0.4465)
+cifar10_std = (0.2023, 0.1994, 0.2010)
 
 def normalize(x, mean=cifar10_mean, std=cifar10_std):
     x, mean, std = [np.array(a, np.float32) for a in (x, mean, std)]
@@ -117,7 +120,7 @@ class ToTensor(object):
 
 class CIFAR10_labeled(torchvision.datasets.CIFAR10):
 
-    def __init__(self, root, indexs=None, train=True,
+    def __init__(self, root, query_model = None, indexs=None, train=True,
                  transform=None, target_transform=None,
                  download=False):
         super(CIFAR10_labeled, self).__init__(root, train=train,
