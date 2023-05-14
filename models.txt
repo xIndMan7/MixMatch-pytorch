@@ -1,0 +1,1 @@
+resnet50_cifar_try 24.2 6
