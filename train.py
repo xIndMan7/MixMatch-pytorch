@@ -16,14 +16,59 @@ import torch.optim as optim
 import torch.utils.data as data
 import torchvision.transforms as transforms
 import torch.nn.functional as F
+from torchvision.models import vgg19, resnet50 as res50_pt, resnet18 as res18_pt, densenet121, convnext_tiny, wide_resnet50_2
+from torchvision.models import resnet18, resnet34, resnet50, resnet101, resnet152, densenet161, mobilenet_v3_small
+from ray_models import ResNet18, ResNet34, ResNet50, ResNet101
+import torchvision
+
+import sys
+if '/serenity/data/ppml/' not in sys.path:
+    sys.path.append('/serenity/data/ppml/')
+
+# if '/nethome/dsanyal7/ppml/ppml_model_serving/src/clockwork/' not in sys.path:
+#     sys.path.append('/nethome/dsanyal7/ppml/')
 
 import models.wideresnet as models
 import dataset.cifar10 as dataset
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 from tensorboardX import SummaryWriter
+from cifar10_models.resnet import resnet18 as resnet18_m, resnet34 as resnet34_m, resnet50 as resnet50_m, resnet152 as resnet152_m
+# from cifar10_models.resnet import resnet18, resnet34, resnet50
+from cifar10_models.vgg import vgg11_bn, vgg19_bn
+from ppml_model_serving.src.model_serving.model_server import *
+from ppml_model_serving.src.models.wide_resnet28 import *
+from clockwork.clockwork import *
+
+import sys
+import wandb
+
+import importlib  
+foobar = importlib.import_module("pytorch-cifar.models")
+
+
+dispatcher = {18: resnet18, 34: resnet34, 50: resnet50, 101: resnet101, 152: resnet152, 161: densenet161, 3: mobilenet_v3_small}
+mixmatch_dispatcher = {18: resnet18_m, 34: resnet34_m, 50: resnet50_m, 152: resnet152_m}
 
 parser = argparse.ArgumentParser(description='PyTorch MixMatch Training')
 # Optimization options
+parser.add_argument('--direct', default=False, type=bool, metavar='If Direct Model Zoo',
+                    help='run model zoo', action=argparse.BooleanOptionalAction)
+
+parser.add_argument('--lb', default=False, type=bool, metavar='Latency Bound',
+                    help='Latency Bound', action=argparse.BooleanOptionalAction)
+
+parser.add_argument('--zoo', default=False, type=bool, metavar='If zoo',
+                    help='run model zoo', action=argparse.BooleanOptionalAction)
+parser.add_argument('--clockwork', default=False, type=bool, metavar='If clockwork',
+                    help='run clockwork model zoo', action=argparse.BooleanOptionalAction)
+parser.add_argument('--server', default=False, type=bool, metavar='If zoo',
+                    help='use inference', action=argparse.BooleanOptionalAction)
+parser.add_argument('--zoo_victim', default=0, type=int, metavar='which model in zoo',
+                    help='model zoo')
+# parser.add_argument('--oracle-server', default="", type=str, metavar='',
+#                     help='')
+parser.add_argument('--fingerprinting', default=False, type=bool, metavar='',
+                    help='', action=argparse.BooleanOptionalAction)
 parser.add_argument('--epochs', default=1024, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
@@ -32,6 +77,21 @@ parser.add_argument('--batch-size', default=64, type=int, metavar='N',
                     help='train batchsize')
 parser.add_argument('--lr', '--learning-rate', default=0.002, type=float,
                     metavar='LR', help='initial learning rate')
+
+parser.add_argument('--latency_bound', default=1000000.0, type=float,
+                    metavar='Latency Bound', help='attacker\'s latency bound')
+
+parser.add_argument('--om', '--oracle_model', default="", type=str,
+                    metavar='oracle_model', help='oracle_model')
+
+parser.add_argument('--d', '--dataset', default="CIFAR10", type=str,
+                    metavar='dataset', help='which dataset')
+
+parser.add_argument('--om_r', '--oracle_model_resnet', default=18, type=int,
+                    metavar='resnet type', help='which oracle resnet type')
+
+parser.add_argument('--am_r', '--attack_model_resnet', default=18, type=int,
+                    metavar='resnet type', help='which attack resnet type')
 # Checkpoints
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
@@ -55,6 +115,7 @@ parser.add_argument('--ema-decay', default=0.999, type=float)
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
+print(args)
 
 # Use CUDA
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -75,6 +136,30 @@ def main():
 
     # Data
     print(f'==> Preparing cifar10')
+    # transform_train = transforms.Compose([
+    #     dataset.RandomPadandCrop(32),
+    #     dataset.RandomFlip(),
+    #     dataset.ToTensor(),
+    #     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    # ])
+
+    # transform_train=transforms.Compose([
+    #     transforms.RandomCrop(32, padding=4),
+    #     transforms.RandomHorizontalFlip(),
+    #     transforms.ToTensor(),
+    #     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    # ])
+
+    # transform_val = transform=transforms.Compose([
+    #     transforms.ToTensor(),
+    #     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    # ])
+
+    # transform_val=transforms.Compose([
+    #     transforms.ToTensor(),
+    #     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    # ])
+
     transform_train = transforms.Compose([
         dataset.RandomPadandCrop(32),
         dataset.RandomFlip(),
@@ -85,17 +170,383 @@ def main():
         dataset.ToTensor(),
     ])
 
-    train_labeled_set, train_unlabeled_set, val_set, test_set = dataset.get_cifar10('./data', args.n_labeled, transform_train=transform_train, transform_val=transform_val)
+    server = ModelServer()
+    model_zoo = {}
+
+    acc_lat_dict = {}
+
+    clockwork_accuracy = []
+    clockwork_latency = []
+
+    if args.zoo is False:
+        OracleModel = dispatcher[args.om_r]()
+        if args.om:
+            print("Oracle File Path: ", args.om)
+            OracleModel.load_state_dict(torch.load(args.om, map_location="cpu"))
+        model_zoo = {f"resnet{args.om_r}": OracleModel}
+    else:
+        # OracleModel = []
+        # vgg = vgg11_bn()
+        # vgg19 = vgg19_bn()
+        # res18 = resnet18()
+        # res34 = resnet34()
+        # res50 = resnet50()
+        # OracleModel.append(vgg)
+        # OracleModel.append(res18)
+        # OracleModel.append(res34)
+        # OracleModel.append(res50)
+        # OracleModel[0].load_state_dict(torch.load("models/pretrained_vgg/vgg11_bn.pt"))
+        # OracleModel[1].load_state_dict(torch.load("models/pretrained_resnet/model_9.pth"))
+        # OracleModel[2].load_state_dict(torch.load("models/pretrained_resnet/resnet34_less_acc.pth"))
+        # OracleModel[3].load_state_dict(torch.load("models/pretrained_resnet/resnet50.pt"))
+
+        # r50_m = res50_pt().float()
+        # # r50_m.cuda()
+        # r50_m.load_state_dict(torch.load("../resnet50/model_6.pth"))
+        # # r50_m.eval()
+
+        # # vgg19 = vgg11_bn().to(device)
+        # # vgg19.cuda()
+        # # vgg19.load_state_dict(torch.load("../models/pretrained_vgg/vgg11_bn.pt"))
+        # # vgg19.eval()
+
+        # d121 = densenet121().float()
+        # # d121.cuda()
+        # d121.load_state_dict(torch.load("../densenet121/model_8.pth"))
+        # # d121.eval()
+
+        # convn = convnext_tiny().float()
+        # # convn.cuda()
+        # convn.load_state_dict(torch.load("../convnext/model_9.pth"))
+        # # convn.eval()
+
+        # w50_2 = wide_resnet50_2().float()
+        # # w50_2.cuda()
+        # w50_2.load_state_dict(torch.load("../widerresnet50/model_9.pth"))
+        # # w50_2.eval()
+        if args.clockwork:
+            print("clockwork enabled")
+            
+            models_from_file = []
+            # clockwork_accuracy=[0.6631, 0.6991, 0.7068, 0.0005]
+            # clockwork_latency=[10, 12, 18, 13]
+            
+            if args.d == "CIFAR10":
+                my_file = open("models_cifar.txt", "r")
+            else:
+                my_file = open("models_svhn.txt", "r")
+            data_clkwork = my_file.read()
+            models_info_from_file = data_clkwork.split("\n")
+            for m in models_info_from_file:
+                info = m.split(" ")
+                model_name, acc, lat = info[0], info[1], info[2]
+                clockwork_accuracy.append(float(acc))
+                clockwork_latency.append(int(lat))
+                models_from_file.append(model_name)
+            print("Models being loaded to Clockwork", models_from_file)
+
+            init_request = InitializeRequest(
+                #### ALERT: RESNET18 not loaded
+                models_to_load=models_from_file,
+                models_accuracy=clockwork_accuracy,
+                models_latency_us=clockwork_latency
+            )
+            print("Load Requests Sending....")
+            init_request.send()
+            init_response = InitializeResponse.receive()
+            print("InitializeResponse success:", init_response.success)
+            
+            model_zoo = None
+
+            # print("Oracle File Path: ", args.om)
+            # OracleModel = resnet152()
+            # OracleModel.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/resnet152_90_6.pth"))
+
+            OracleModel = dispatcher[args.om_r]()
+            if args.om:
+                print("Oracle File Path: ", args.om)
+                OracleModel.load_state_dict(torch.load(args.om, map_location="cpu"))
+            else:
+                OracleModel.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/resnet18_41_1.pth", map_location="cpu"))
+        else:
+            OracleModel = []
+
+            #### SHVN ####
+            if (args.d != "CIFAR10"):
+                resnet18_model = torchvision.models.resnet18()
+                resnet18_model.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/resnet18_41_1.pth", map_location="cpu"))
+                resnet18_model.eval()
+
+                resnet34_model = torchvision.models.resnet34()
+                resnet34_model.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/resnet34_48_4.pth", map_location="cpu"))
+                resnet34_model.eval()
+
+                resnet50_model = torchvision.models.resnet50()
+                resnet50_model.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/resnet50_65_2.pth", map_location="cpu"))
+                resnet50_model.eval()
+
+                resnet101_model = torchvision.models.resnet101()
+                resnet101_model.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/resnet101_77_8.pth", map_location="cpu"))
+                resnet101_model.eval()
+
+                resnet152_model = torchvision.models.resnet152()
+                resnet152_model.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/resnet152_90_6.pth", map_location="cpu"))
+                resnet152_model.eval()
+                
+                densenet121_model = torchvision.models.densenet121()
+                densenet121_model.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/densenet121_80_6.pth", map_location="cpu"))
+                densenet121_model.eval()
+
+                densenet161_model = torchvision.models.densenet161()
+                densenet161_model.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/densenet161_91_5.pth", map_location="cpu"))
+                densenet161_model.eval()
+
+                densenet169_model = torchvision.models.densenet169()
+                densenet169_model.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/densenet169_89_8.pth", map_location="cpu"))
+                densenet169_model.eval()
+                
+                wide_resnet28_model = WideResNet28()
+                wide_resnet28_model.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/wideresnet28_44_0.pth", map_location="cpu"))
+                wide_resnet28_model.eval()
+
+                mobilenet_v2_model = torchvision.models.mobilenet_v2()
+                mobilenet_v2_model.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/mobilenet2_51_2.pth", map_location="cpu"))
+                mobilenet_v2_model.eval()
+
+                mobilenet_v3_small_model = torchvision.models.mobilenet_v3_small()
+                mobilenet_v3_small_model.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/mobilenet3_small_57_0.pth", map_location="cpu"))
+                mobilenet_v3_small_model.eval()
+
+                mobilenet_v3_large_model = torchvision.models.mobilenet_v3_large()
+                mobilenet_v3_large_model.load_state_dict(torch.load("../ppml_model_serving/models/svhn_unmod_pytorch/mobilenet3_large_61_6.pth", map_location="cpu"))
+                mobilenet_v3_large_model.eval()
+
+            ### CIFAR
+            else:
+                resnet18_model = torchvision.models.resnet18()
+                resnet18_model.load_state_dict(torch.load("../ppml_model_serving/models/cifar10_unmod_pytorch/resnet18_35_6.pth", map_location="cpu"))
+                resnet18_model.eval()
+
+                resnet34_model = torchvision.models.resnet34()
+                resnet34_model.load_state_dict(torch.load("../ppml_model_serving/models/cifar10_unmod_pytorch/resnet34_46_9.pth", map_location="cpu"))
+                resnet34_model.eval()
+
+                resnet50_model = torchvision.models.resnet50()
+                resnet50_model.load_state_dict(torch.load("../ppml_model_serving/models/cifar10_unmod_pytorch/resnet50_64_4.pth", map_location="cpu"))
+                resnet50_model.eval()
+
+                resnet101_model = torchvision.models.resnet101()
+                resnet101_model.load_state_dict(torch.load("../ppml_model_serving/models/cifar10_unmod_pytorch/resnet101_75_2.pth", map_location="cpu"))
+                resnet101_model.eval()
+
+                resnet152_model = torchvision.models.resnet152()
+                resnet152_model.load_state_dict(torch.load("../ppml_model_serving/models/cifar10_unmod_pytorch/resnet152_85_5.pth", map_location="cpu"))
+                resnet152_model.eval()
+                
+                densenet121_model = torchvision.models.densenet121()
+                densenet121_model.load_state_dict(torch.load("../ppml_model_serving/models/cifar10_unmod_pytorch/densenet121_79_2.pth", map_location="cpu"))
+                densenet121_model.eval()
+
+                densenet161_model = torchvision.models.densenet161()
+                densenet161_model.load_state_dict(torch.load("../ppml_model_serving/models/cifar10_unmod_pytorch/densenet161_87_1.pth", map_location="cpu"))
+                densenet161_model.eval()
+
+                densenet169_model = torchvision.models.densenet169()
+                densenet169_model.load_state_dict(torch.load("../ppml_model_serving/models/cifar10_unmod_pytorch/densenet169_84_8.pth", map_location="cpu"))
+                densenet169_model.eval()
+                
+                wide_resnet28_model = WideResNet28()
+                wide_resnet28_model.load_state_dict(torch.load("../ppml_model_serving/models/cifar10_unmod_pytorch/wideresnet28_44_5.pth", map_location="cpu"))
+                wide_resnet28_model.eval()
+
+                mobilenet_v2_model = torchvision.models.mobilenet_v2()
+                mobilenet_v2_model.load_state_dict(torch.load("../ppml_model_serving/models/cifar10_unmod_pytorch/mobilenet2_51_9.pth", map_location="cpu"))
+                mobilenet_v2_model.eval()
+
+                mobilenet_v3_small_model = torchvision.models.mobilenet_v3_small()
+                mobilenet_v3_small_model.load_state_dict(torch.load("../ppml_model_serving/models/cifar10_unmod_pytorch/mobilenet3_small_55_2.pth", map_location="cpu"))
+                mobilenet_v3_small_model.eval()
+
+                mobilenet_v3_large_model = torchvision.models.mobilenet_v3_large()
+                mobilenet_v3_large_model.load_state_dict(torch.load("../ppml_model_serving/models/cifar10_unmod_pytorch/mobilenet3_large_58_7.pth", map_location="cpu"))
+                mobilenet_v3_large_model.eval()
+
+
+            model_zoo = {
+                "resnet18": resnet18_model,
+                "resnet34": resnet34_model,
+                "resnet50": resnet50_model,
+                "resnet101": resnet101_model,
+                "resnet152": resnet152_model,
+                "densenet121": densenet121_model,
+                "densenet161": densenet161_model,
+                "densenet169": densenet169_model,
+                "wide_resnet28": wide_resnet28_model,
+                "mobilenet_v2": mobilenet_v2_model,
+                "mobilenet_v3_small": mobilenet_v3_small_model,
+                "mobilenet_v3_large": mobilenet_v3_large_model,
+            }
+
+            ##### MID-ZOO ####
+            # r18_m = resnet18().float()
+            # r18_m.load_state_dict(torch.load("../resnet18/model_0.pth"))
+            # r18_m.eval()
+
+            # r34_m = resnet34().float()
+            # r34_m.load_state_dict(torch.load("../resnet34/model_2.pth"))
+            # r34_m.eval()
+
+            # r50_m = resnet50().float()
+            # r50_m.load_state_dict(torch.load("../resnet50/model_8.pth"))
+            # r50_m.eval()
+
+
+            # r101_m = resnet101().float()
+            # r101_m.load_state_dict(torch.load("../resnet101/model_2.pth"))
+            # r101_m.eval()
+
+            # r152_m = resnet152().float()
+            # r152_m.load_state_dict(torch.load("../resnet152/model_4.pth"))
+            # r152_m.eval()
+
+            #### HIGH-ZOO ###
+            # r18_m = resnet18_m().float()
+            # r18_m.load_state_dict(torch.load("../high_zoo/resnet18.pt"))
+            # r18_m.eval()
+
+
+            # r34_m = resnet34_m().float()
+            # r34_m.load_state_dict(torch.load("../high_zoo/resnet34.pt"))
+            # r34_m.eval()
+
+
+            # r50_m = resnet50_m().float()
+            # r50_m.load_state_dict(torch.load("../high_zoo/resnet50.pt"))
+            # r50_m.eval()
+
+
+            # r101_m = foobar.ResNet101().float()
+            # t_101_d = torch.load("../pytorch-cifar/checkpoint/ckpt.pth")["net"]
+            # r101_dict_n = {}
+            # for k in t_101_d.keys():
+            #     if "module." in k:
+            #         new_k = k.replace("module.", "")
+            #         r101_dict_n[new_k] = t_101_d[k]
+            # r101_m.load_state_dict(r101_dict_n)
+            # r101_m.eval()
+
+
+            # r152_m = foobar.ResNet152().float()
+            # t_152_d = torch.load("../pytorch-cifar/checkpoint/ckpt1.pth")["net"]
+            # r152_dict_n = {}
+            # for k in t_152_d.keys():
+            #     if "module." in k:
+            #         new_k = k.replace("module.", "")
+            #         r152_dict_n[new_k] = t_152_d[k]
+            # r152_m.load_state_dict(r152_dict_n)
+            # r152_m.eval()
+
+
+            #### NEW SPREAD OUT ZOO
+            # r18_m = ResNet18().float()
+            # # r18_m.load_state_dict(torch.load("../resnet18/model_0.pth"))
+            # r18_m.load_state_dict(torch.load("/serenity/data/ppml/ppml_model_serving/models/resnet18_model_acc_76_7.pth", map_location='cpu'))
+            # r18_m.eval()
+
+            # r34_m = ResNet34().float()
+            # # r34_m.load_state_dict(torch.load("../resnet34/model_2.pth"))
+            # r34_m.load_state_dict(torch.load("/serenity/data/ppml/ppml_model_serving/models/resnet34_model_acc_80_1.pth", map_location='cpu'))
+            # r34_m.eval()
+
+            # r50_m = ResNet50().float()
+            # # r50_m.load_state_dict(torch.load("../resnet50/model_8.pth"))
+            # r50_m.load_state_dict(torch.load("/serenity/data/ppml/ppml_model_serving/models/resnet50_model_acc_86_7.pth", map_location='cpu'))
+            # r50_m.eval()
+
+            # r101_m = ResNet101().float()
+            # # r50_m.load_state_dict(torch.load("../resnet50/model_8.pth"))
+            # r101_m.load_state_dict(torch.load("/serenity/data/ppml/ppml_model_serving/models/resnet101_model_acc_89_9.pth", map_location='cpu'))
+            # r101_m.eval()
+
+            # r152_m = foobar.ResNet152().float()
+            # t_152_d = torch.load("../pytorch-cifar/checkpoint/ckpt1.pth")["net"]
+            # r152_dict_n = {}
+            # for k in t_152_d.keys():
+            #     if "module." in k:
+            #         new_k = k.replace("module.", "")
+            #         r152_dict_n[new_k] = t_152_d[k]
+            # r152_m.load_state_dict(r152_dict_n)
+            # r152_m.eval()
+
+
+            # model_zoo = {
+            # # #     "r18": r18_m,
+            # #     "r50": r50_m,
+            # # #     "vgg19": vgg19,
+            # #     "densenet121": d121,
+            # #     "convnext": convn,
+            # #     "widerresnet": w50_2
+            #     "r18": r18_m,
+            #     "r34": r34_m,
+            #     "r50": r50_m,
+            #     "r101": r101_m,
+            #     "r152": r152_m,
+            # }
+
+            for k, v in model_zoo.items():
+                OracleModel.append(v)
+    
+    wandb.init(
+    # set the wandb project where this run will be logged
+        project="ppml_proj",
+        
+        # track hyperparameters and run metadata
+        config={
+            "learning_rate": args.lr,
+            "architecture": "Resnet",
+            "dataset": "CIFAR-10",
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "start_epochs": args.start_epoch,
+
+            "iteration": args.train_iteration,
+            "labelled_datapoints": args.n_labeled,
+
+            "oracle_resnet": args.om_r,
+            "attack_resnet": args.am_r,
+            "alpha": args.alpha,
+            "lambda_u": args.lambda_u,
+            "T": args.lambda_u,
+            "ema_decay": args.ema_decay,
+            "model_zoo": args.zoo,
+        }
+    )
+
+    print("Labelled: ", args.n_labeled)
+    train_labeled_set, train_unlabeled_set, val_set, test_set, oracle_train_dataset, oracle_actual_dataset, oracle_val_dataset, oracle_test_dataset = dataset.get_cifar10('./data', args.n_labeled, 
+                                                        oracle_model=OracleModel, transform_train=transform_train, transform_val=transform_val, use_cuda=use_cuda, which_model=args.zoo_victim, server=args.server,
+                                                        model_zoo=model_zoo, fingerprinting=args.fingerprinting, clockwork=args.clockwork, clockwork_acc=clockwork_accuracy, clockwork_lat=clockwork_latency,
+                                                        direct=args.direct, dataset=args.d, lb=args.lb, latency_bound=args.latency_bound)
     labeled_trainloader = data.DataLoader(train_labeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     unlabeled_trainloader = data.DataLoader(train_unlabeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
+    # oracle_trainloader = data.DataLoader(train_unlabeled_set, model=args.om, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     val_loader = data.DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
     test_loader = data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
-
+    
+    oracle_train_loader = data.DataLoader(oracle_train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
+    oracle_train_actual_loader = data.DataLoader(oracle_actual_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
+    oracle_val_loader = data.DataLoader(oracle_val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    oracle_test_loader = data.DataLoader(oracle_test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    
     # Model
-    print("==> creating WRN-28-2")
 
-    def create_model(ema=False):
-        model = models.WideResNet(num_classes=10)
+    def create_model(ema=False, args=None):
+        # model = models.WideResNet(num_classes=10)
+        if args:
+            model = mixmatch_dispatcher[args.am_r](pretrained=False)
+            # model = resnet18_m(pretrained=False)
+        else:
+            model = resnet18(pretrained=False)
         model = model.cuda()
 
         if ema:
@@ -104,8 +555,8 @@ def main():
 
         return model
 
-    model = create_model()
-    ema_model = create_model(ema=True)
+    model = create_model(args=args)
+    ema_model = create_model(ema=True, args=args)
 
     cudnn.benchmark = True
     print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters())/1000000.0))
@@ -116,6 +567,9 @@ def main():
 
     ema_optimizer= WeightEMA(model, ema_model, alpha=args.ema_decay)
     start_epoch = 0
+
+    print(args)
+
 
     # Resume
     title = 'noisy-cifar-10'
@@ -130,10 +584,10 @@ def main():
         model.load_state_dict(checkpoint['state_dict'])
         ema_model.load_state_dict(checkpoint['ema_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer'])
-        logger = Logger(os.path.join(args.out, 'log.txt'), title=title, resume=True)
+        logger = Logger(os.path.join(args.out, str(args.om_r)+'o_'+str(args.am_r)+'_'+str(args.n_labeled)+'_log.txt'), title=title, resume=True)
     else:
-        logger = Logger(os.path.join(args.out, 'log.txt'), title=title)
-        logger.set_names(['Train Loss', 'Train Loss X', 'Train Loss U',  'Valid Loss', 'Valid Acc.', 'Test Loss', 'Test Acc.'])
+        logger = Logger(os.path.join(args.out, str(args.om_r)+'o_'+str(args.am_r)+'_'+str(args.n_labeled)+'_log.txt'), title=title)
+        logger.set_names(['Train Loss', 'Train Loss X', 'Train Loss U',  'Valid Loss', 'Valid Acc.', 'Test Loss', 'Test Acc.', 'Train Fid', 'Valid Fid', 'Test Fid'])
 
     writer = SummaryWriter(args.out)
     step = 0
@@ -143,10 +597,16 @@ def main():
 
         print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
 
-        train_loss, train_loss_x, train_loss_u = train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, train_criterion, epoch, use_cuda)
+        train_loss, train_loss_x, train_loss_u = train(oracle_train_loader, unlabeled_trainloader, model, optimizer, ema_optimizer, train_criterion, epoch, use_cuda)
         _, train_acc = validate(labeled_trainloader, ema_model, criterion, epoch, use_cuda, mode='Train Stats')
         val_loss, val_acc = validate(val_loader, ema_model, criterion, epoch, use_cuda, mode='Valid Stats')
+        print("test loader")
         test_loss, test_acc = validate(test_loader, ema_model, criterion, epoch, use_cuda, mode='Test Stats ')
+        print("reached here after test")
+        # _, train_fidelity = validate(oracle_train_actual_loader, ema_model, criterion, epoch, use_cuda, mode='Train Fidelity Stats')
+        train_fidelity=1
+        _, val_fidelity = validate(oracle_val_loader, ema_model, criterion, epoch, use_cuda, mode='Valid Fidelity Stats')
+        _, test_fidelity = validate(oracle_test_loader, ema_model, criterion, epoch, use_cuda, mode='Test Fidelity Stats ')
 
         step = args.train_iteration * (epoch + 1)
 
@@ -158,8 +618,13 @@ def main():
         writer.add_scalar('accuracy/val_acc', val_acc, step)
         writer.add_scalar('accuracy/test_acc', test_acc, step)
 
+        writer.add_scalar('fidelity/train_fid', train_fidelity, step)
+        writer.add_scalar('fidelity/val_fid', val_fidelity, step)
+        writer.add_scalar('fidelity/test_fid', test_fidelity, step)
+
         # append logger file
-        logger.append([train_loss, train_loss_x, train_loss_u, val_loss, val_acc, test_loss, test_acc])
+        logger.append([train_loss, train_loss_x, train_loss_u, val_loss, val_acc, test_loss, test_acc, train_fidelity, val_fidelity, test_fidelity])
+        wandb.log({"train_loss": train_loss, "train_loss_labelled": train_loss_x, "train_loss_unlabelled": train_loss_u, "validation_loss": val_loss, "validation_accuracy": val_acc, "test_loss": test_loss, "test_acc": test_acc, "fidelity_train": train_fidelity, "fidelity_val": val_fidelity, "fidelity_test": test_fidelity, "train_acc": train_acc})
 
         # save model
         is_best = val_acc > best_acc
@@ -200,16 +665,16 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
     model.train()
     for batch_idx in range(args.train_iteration):
         try:
-            inputs_x, targets_x = labeled_train_iter.next()
+            inputs_x, targets_x = next(labeled_train_iter)
         except:
             labeled_train_iter = iter(labeled_trainloader)
-            inputs_x, targets_x = labeled_train_iter.next()
+            inputs_x, targets_x = next(labeled_train_iter)
 
         try:
-            (inputs_u, inputs_u2), _ = unlabeled_train_iter.next()
+            (inputs_u, inputs_u2), _ = next(unlabeled_train_iter)
         except:
             unlabeled_train_iter = iter(unlabeled_trainloader)
-            (inputs_u, inputs_u2), _ = unlabeled_train_iter.next()
+            (inputs_u, inputs_u2), _ = next(unlabeled_train_iter)
 
         # measure data loading time
         data_time.update(time.time() - end)
@@ -414,4 +879,5 @@ def interleave(xy, batch):
     return [torch.cat(v, dim=0) for v in xy]
 
 if __name__ == '__main__':
+    sys.path.append("../../MixMatch-pytorch/")
     main()
